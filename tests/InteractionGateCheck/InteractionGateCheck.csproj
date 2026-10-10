@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <!-- Headless check of the hover-only rule for interactive nodes. It compiles the pure decision type
+         (no ImGui, no Dalamud) straight from the library sources. Run it with: dotnet run on this project, Release configuration. -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <IsPackable>false</IsPackable>
+        <OutputPath>..\..\out\tests\$(Configuration)\InteractionGateCheck\</OutputPath>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="..\..\Una.Drawing\src\Node\InteractionGate.cs" Link="InteractionGate.cs" />
+    </ItemGroup>
+</Project>

@@ -124,9 +124,17 @@ public partial class Node
     private double _isVisibleSince;
     private double _lastClickTime;
 
+    // Hover-only interactive windows (see SetupInteractive).
+    private bool    _wasItemActive;
+    private bool    _skippedByGate;
+    private bool    _descendantBusy;
+    private string? _buttonLabel;
+    private string? _buttonLabelOwner;
+
     private void SetupInteractive(ImDrawListPtr drawList)
     {
         _didStartInteractive = false;
+        _skippedByGate       = false;
 
         ToggleTag("disabled", IsDisabled);
         RenderTooltip();
@@ -151,11 +159,27 @@ public partial class Node
             return;
         }
 
-        if (_isVisibleSince == 0) _isVisibleSince = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        long frameNow = InteractionFrame.NowMs;
+
+        if (_isVisibleSince == 0) _isVisibleSince = frameNow;
 
         // Debounce the interactive state to prevent unintentional clicks
         // when toggling visibility on elements on the same position.
-        if (DateTimeOffset.Now.ToUnixTimeMilliseconds() - _isVisibleSince < 100) return;
+        if (frameNow - _isVisibleSince < 100) return;
+
+        Node? interactiveParent = GetInteractiveParent(out bool interactiveParentSkipped);
+
+        // Opening an ImGui window per interactive node per frame is the main
+        // cost of the strip, and only matters near the mouse. A node that is
+        // not near the mouse and has no interaction state left to settle does
+        // not open its window at all; see InteractionGate.
+        bool descendantBusy = _descendantBusy;
+        _descendantBusy = false;
+
+        if (interactiveParentSkipped || !MustOpenInteractiveWindow(descendantBusy)) {
+            SettleSkippedInteractive();
+            return;
+        }
 
         _didStartInteractive = true;
 
@@ -167,7 +191,6 @@ public partial class Node
 
         string  imGuiId           = InternalId;
         Vector2 boundingBoxSize   = Bounds.PaddingSize.ToVector2();
-        Node?   interactiveParent = GetInteractiveParent();
         _isInWindowOrInteractiveParent = (!isPassthrough && IsInWindowDrawList(drawList)) || interactiveParent != null;
 
         // Disabled to allow for multi-monitor support. Leaving this here in case something breaks.
@@ -187,9 +210,15 @@ public partial class Node
         bool wasDragging = IsDragging;
 
         ImGui.SetCursorScreenPos(Bounds.PaddingRect.TopLeft);
-        ImGui.InvisibleButton($"{imGuiId}##Button", Bounds.PaddingSize.ToVector2());
-        IsMouseOver = ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenOverlapped);
-        IsFocused   = ImGui.IsItemFocused();
+        if (!ReferenceEquals(_buttonLabelOwner, imGuiId)) {
+            _buttonLabelOwner = imGuiId;
+            _buttonLabel      = $"{imGuiId}##Button";
+        }
+
+        ImGui.InvisibleButton(_buttonLabel, Bounds.PaddingSize.ToVector2());
+        IsMouseOver    = ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenOverlapped);
+        IsFocused      = ImGui.IsItemFocused();
+        _wasItemActive = ImGui.IsItemActive();
         IsDragging  = IsDragging || (IsMouseOver && ImGui.IsMouseDragging(ImGuiMouseButton.Left));
 
         var isHovered = ImGui.IsItemHovered();
@@ -255,7 +284,7 @@ public partial class Node
         switch (wasHovered) {
             case false when IsMouseOver:
                 RaiseEvent(OnMouseEnter);
-                _mouseOverStartTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+                _mouseOverStartTime = frameNow;
                 break;
             case true when !IsMouseOver:
                 RaiseEvent(OnMouseLeave);
@@ -269,7 +298,7 @@ public partial class Node
         if (isHovered) {
             if (HasPrimaryInteraction) ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
 
-            if (_mouseOverStartTime < DateTimeOffset.Now.ToUnixTimeMilliseconds() - 50) {
+            if (_mouseOverStartTime < frameNow - 50) {
                 if (!_didStartDelayedMouseEnter) {
                     RaiseEvent(OnDelayedMouseEnter);
                     _didStartDelayedMouseEnter = true;
@@ -295,7 +324,7 @@ public partial class Node
                     RaiseEvent(OnClick);
                     IsMouseDown = false;
                     
-                    var now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+                    var now = frameNow;
                     if (_lastClickTime > 0 && now - _lastClickTime < 250) {
                         RaiseEvent(OnDoubleClick);
                     }
@@ -326,6 +355,72 @@ public partial class Node
         if (IsMouseDownOverOtherNode && !ImGui.IsMouseDown(ImGuiMouseButton.Left)) {
             IsMouseDownOverOtherNode = false;
         }
+
+        // A node that still has state to settle keeps every interactive
+        // ancestor running its window too, because this node nests its own
+        // window in theirs (BeginChild).
+        if (CreateInteractionState(false).IsBusy) MarkInteractiveAncestorsBusy();
+    }
+
+    private InteractionGate.State CreateInteractionState(bool descendantBusy)
+    {
+        return new InteractionGate.State(
+            IsMouseOver,
+            IsDragging,
+            IsFocused,
+            _wasItemActive,
+            IsMouseDown,
+            IsMiddleMouseDown,
+            IsRightMouseDown,
+            descendantBusy
+        );
+    }
+
+    private bool MustOpenInteractiveWindow(bool descendantBusy)
+    {
+        InteractionGate.State state = CreateInteractionState(descendantBusy);
+
+        // Cheap exit first: no need to touch the mouse for a node that is busy.
+        if (state.IsBusy) return true;
+
+        return InteractionGate.MustProcess(
+            Bounds.PaddingRect.TopLeft,
+            Bounds.PaddingRect.BottomRight,
+            InteractionFrame.MousePos,
+            InteractionFrame.MouseDelta,
+            in state
+        );
+    }
+
+    /// <summary>
+    /// Does what the full path of <see cref="SetupInteractive"/> does to a node
+    /// that the mouse is not on and that has no pending interaction state:
+    /// removes the hover, focus and active tags and the cursor registration,
+    /// and tracks whether the left mouse button is held down elsewhere.
+    /// </summary>
+    private void SettleSkippedInteractive()
+    {
+        _skippedByGate = true;
+
+        MouseCursor.RemoveMouseOver(this);
+
+        if (HasTag("hover")) RemoveTag("hover");
+        if (HasTag("focus")) RemoveTag("focus");
+        if (HasTag("active")) RemoveTag("active");
+
+        // Same as the "not hovered" tail of the full path: set while the button
+        // is down over anything else, cleared as soon as it is released.
+        IsMouseDownOverOtherNode = ImGui.IsMouseDown(ImGuiMouseButton.Left);
+    }
+
+    private void MarkInteractiveAncestorsBusy()
+    {
+        Node? ancestor = ParentNode;
+
+        while (ancestor != null) {
+            if (ancestor.IsInteractive) ancestor._descendantBusy = true;
+            ancestor = ancestor.ParentNode;
+        }
     }
 
     private void EndInteractive()
@@ -345,13 +440,23 @@ public partial class Node
     /// Returns the top-most interactive parent element.
     /// </summary>
     /// <returns></returns>
-    private Node? GetInteractiveParent()
+    private Node? GetInteractiveParent(out bool anySkipped)
     {
         Node? immediateParent   = ParentNode;
         Node? interactiveParent = null;
 
+        // True if an interactive ancestor skipped opening its window this
+        // frame. This node would nest its window in that window, so it has
+        // to skip as well (the mouse cannot be on it: it is clipped by the
+        // ancestor's window).
+        anySkipped = false;
+
         while (immediateParent != null) {
-            if (immediateParent.IsInteractive) interactiveParent = immediateParent;
+            if (immediateParent.IsInteractive) {
+                interactiveParent = immediateParent;
+                if (immediateParent._skippedByGate) anySkipped = true;
+            }
+
             immediateParent = immediateParent.ParentNode;
         }
 
@@ -424,7 +529,7 @@ public partial class Node
             return;
         }
         
-        var now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        var now = InteractionFrame.NowMs;
         if (_tooltipHoverStartTime == 0) {
             _tooltipHoverStartTime = now;
         }

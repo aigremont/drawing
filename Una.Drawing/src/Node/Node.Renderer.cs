@@ -191,7 +191,7 @@ public partial class Node
             return;
         }
 
-        if (_isVisibleSince == 0) _isVisibleSince = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+        if (_isVisibleSince == 0) _isVisibleSince = InteractionFrame.NowMs;
 
         PushDrawList(drawList);
         BeginOverflowContainer();
